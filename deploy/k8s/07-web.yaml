@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: au-agent-web
+  namespace: au-agent
+  labels:
+    app: au-agent-web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: au-agent-web
+  template:
+    metadata:
+      labels:
+        app: au-agent-web
+    spec:
+      containers:
+        - name: web
+          image: YOUR_REGISTRY/au-agent-web:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: au-agent-web
+  namespace: au-agent
+  labels:
+    app: au-agent-web
+spec:
+  type: ClusterIP
+  selector:
+    app: au-agent-web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: au-agent-web
+  namespace: au-agent
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: au-agent-web
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

@@ -1,0 +1,49 @@
+# 生产向 Docker Compose：API + Web + Redis
+# MySQL 默认使用外部实例（与现网一致）；也可取消注释本地 mysql。
+# 用法见 deploy/README.md
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
+  au-agent-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: au-agent-api:latest
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    environment:
+      APP_ENV: production
+      DEBUG: "false"
+      REDIS_URL: redis://redis:6379/0
+      CHROMA_PERSIST_DIR: /app/data/chroma
+    volumes:
+      - chroma_data:/app/data/chroma
+    depends_on:
+      - redis
+    expose:
+      - "8000"
+    # 本机调试可打开: "8000:8000"
+    # ports:
+    #   - "8000:8000"
+
+  au-agent-web:
+    build:
+      context: ../au-agent-web-example
+      dockerfile: Dockerfile
+    image: au-agent-web:latest
+    restart: unless-stopped
+    depends_on:
+      - au-agent-api
+    ports:
+      - "8080:80"
+
+volumes:
+  redis_data:
+  chroma_data:

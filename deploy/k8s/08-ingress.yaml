@@ -1,0 +1,33 @@
+# 需要集群已安装 Ingress Controller（nginx / traefik 等）
+# 将 host 改成你的域名；若暂无域名可用 NodePort 见下方注释方案
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: au-agent
+  namespace: au-agent
+  annotations:
+    # nginx ingress
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    # 若启用 TLS，取消注释并配置 cert-manager / 证书 Secret
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: au-agent.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: au-agent-web
+                port:
+                  number: 80
+  # tls:
+  #   - hosts:
+  #       - au-agent.example.com
+  #     secretName: au-agent-tls

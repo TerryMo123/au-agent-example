@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: au-agent-redis
+  namespace: au-agent
+  labels:
+    app: au-agent-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: au-agent-redis
+  template:
+    metadata:
+      labels:
+        app: au-agent-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["redis-server", "--appendonly", "yes"]
+          ports:
+            - containerPort: 6379
+              name: redis
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: au-agent-redis
+  namespace: au-agent
+spec:
+  selector:
+    app: au-agent-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

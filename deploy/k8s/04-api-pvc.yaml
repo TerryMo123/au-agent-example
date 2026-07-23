@@ -1,0 +1,14 @@
+# Chroma 本地文件存储。默认 RWO：API 建议 replicas=1。
+# 若集群有 NFS/RWX StorageClass，可改 accessModes 并提高 API 副本数。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: au-agent-chroma
+  namespace: au-agent
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # storageClassName: nfs-rwx   # 多副本时换成支持 RWX 的类

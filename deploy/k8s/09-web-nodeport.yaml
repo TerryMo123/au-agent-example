@@ -1,0 +1,17 @@
+# 无 Ingress 时可用：把 Web 暴露为 NodePort / LoadBalancer
+apiVersion: v1
+kind: Service
+metadata:
+  name: au-agent-web-nodeport
+  namespace: au-agent
+  labels:
+    app: au-agent-web
+spec:
+  type: NodePort
+  selector:
+    app: au-agent-web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 30080

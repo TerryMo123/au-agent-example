@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: au-agent-api
+  namespace: au-agent
+  labels:
+    app: au-agent-api
+spec:
+  # Chroma 为 RWO 时请保持 1；改用 RWX 后再调高
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: au-agent-api
+  template:
+    metadata:
+      labels:
+        app: au-agent-api
+    spec:
+      containers:
+        - name: api
+          image: YOUR_REGISTRY/au-agent-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: au-agent-config
+            - secretRef:
+                name: au-agent-secret
+          volumeMounts:
+            - name: chroma
+              mountPath: /app/data/chroma
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            timeoutSeconds: 5
+      volumes:
+        - name: chroma
+          persistentVolumeClaim:
+            claimName: au-agent-chroma
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: au-agent-api
+  namespace: au-agent
+  labels:
+    app: au-agent-api
+spec:
+  type: ClusterIP
+  selector:
+    app: au-agent-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
