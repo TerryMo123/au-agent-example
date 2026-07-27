@@ -68,6 +68,14 @@ class Settings(BaseSettings):
         default=500, alias="SEMANTIC_CACHE_MAX_ENTRIES"
     )
 
+    # JWT 认证
+    jwt_secret: str = Field(
+        default="au-agent-dev-secret-change-me",
+        alias="JWT_SECRET",
+        description="生产环境务必更换",
+    )
+    jwt_expire_hours: int = Field(default=24, alias="JWT_EXPIRE_HOURS")
+
     @property
     def mysql_url(self) -> str:
         user = quote_plus(self.mysql_user)

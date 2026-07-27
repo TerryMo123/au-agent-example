@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.auth import AuthUser, get_current_user
 from app.schemas.chat import (
     SessionCreateRequest,
     SessionDetail,
@@ -9,8 +10,11 @@ from app.schemas.chat import (
 )
 from app.services.session_service import SessionService, get_session_service
 
-router = APIRouter(prefix="/sessions", tags=["sessions"])
-
+router = APIRouter(
+    prefix="/sessions",
+    tags=["sessions"],
+    dependencies=[Depends(get_current_user)],
+)
 
 @router.post("", response_model=SessionSummary, status_code=status.HTTP_201_CREATED)
 async def create_session(

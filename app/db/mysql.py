@@ -22,6 +22,7 @@ class Base(DeclarativeBase):
 def init_db() -> None:
     # 延迟导入，避免循环依赖
     from app.db import models  # noqa: F401
+    from app.auth import AppUser  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
 

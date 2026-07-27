@@ -76,8 +76,11 @@ class NL2SQLSkill:
         sql = re.sub(r"^(sql|mysql)\s*[:：]\s*", "", sql, flags=re.IGNORECASE)
         return sql.strip()
 
-    def validate_sql(self, sql: str) -> str | None:
+    def validate_sql(
+        self, sql: str, *, allowed_tables: set[str] | None = None
+    ) -> str | None:
         """返回错误信息；通过则返回 None."""
+        tables = allowed_tables or ALLOWED_TABLES
         if not sql:
             return "SQL 为空"
         normalized = sql.strip().lower()
@@ -87,12 +90,24 @@ class NL2SQLSkill:
             return "不允许一次执行多条语句"
         if any(k in normalized for k in DANGEROUS_SQL_KEYWORDS):
             return "检测到危险 SQL 关键字"
-        if not any(table in normalized for table in ALLOWED_TABLES):
-            return f"只能查询白名单表: {', '.join(sorted(ALLOWED_TABLES))}"
+        if not any(table in normalized for table in tables):
+            return f"只能查询白名单表: {', '.join(sorted(tables))}"
+        # 禁止表显式出现
+        forbidden = ALLOWED_TABLES - tables
+        for t in forbidden:
+            if re.search(rf"\b{re.escape(t)}\b", normalized):
+                return f"当前账号无权查询表: {t}"
         return None
 
-    def execute_sql(self, sql: str, *, limit: int = 50) -> tuple[str, list[dict[str, Any]]]:
-        err = self.validate_sql(sql)
+    def execute_sql(
+        self,
+        sql: str,
+        *,
+        limit: int = 50,
+        allowed_tables: set[str] | None = None,
+        mask_role: str | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        err = self.validate_sql(sql, allowed_tables=allowed_tables)
         if err:
             return f"错误: {err}", []
 
@@ -103,6 +118,10 @@ class NL2SQLSkill:
             if not raw_rows:
                 return "查询成功，无结果。", []
             rows = serialize_rows([dict(r) for r in raw_rows[:limit]])
+            if mask_role == "user":
+                from app.auth.security import mask_sensitive_rows
+
+                rows = mask_sensitive_rows(rows, role="user")
             return str(rows), rows
         except Exception as exc:  # noqa: BLE001
             return f"SQL 执行失败: {exc}", []
@@ -116,12 +135,24 @@ class NL2SQLSkill:
             return cleaned
         return cleaned[: max_chars - 1] + "…"
 
+    def _tables_for_role(self, role: str | None) -> set[str]:
+        from app.auth.security import filter_sql_tables_for_role
+
+        role_name = "manager" if role == "manager" else "user"
+        if not role:
+            role_name = "manager"
+        return set(filter_sql_tables_for_role(sorted(ALLOWED_TABLES), role_name))  # type: ignore[arg-type]
+
     def _build_generate_prompt(
         self,
         question: str,
         metric_context: str = "",
         knowledge_context: str = "",
+        *,
+        allowed_tables: set[str] | None = None,
+        role: str | None = None,
     ) -> str:
+        tables = allowed_tables or ALLOWED_TABLES
         metrics_block = f"\n{metric_context}\n" if metric_context.strip() else ""
         knowledge = self._truncate_knowledge(knowledge_context)
         knowledge_block = ""
@@ -131,11 +162,17 @@ class NL2SQLSkill:
 {knowledge}
 说明: 可用于理解时间窗口、站点/渠道口径、业务筛选条件；禁止据此编造表或字段。
 """
+        acl = ""
+        if role == "user":
+            acl = (
+                "\n权限: 当前为运营组员，禁止查询采购成本、海运费率、费用-营收贡献等敏感表；"
+                "不要输出 cogs/unit_cost/contribution/ocean_freight/rate_usd 等字段。\n"
+            )
         return f"""你是傲基（外贸家具）MySQL NL2SQL 助手。根据用户问题生成一条 SELECT。
-只能查询: {", ".join(sorted(ALLOWED_TABLES))}
+只能查询: {", ".join(sorted(tables))}
 {SCHEMA_HINT}
 {FEW_SHOT_EXAMPLES}
-{metrics_block}{knowledge_block}硬性规则:
+{metrics_block}{knowledge_block}{acl}硬性规则:
 - 只返回一条 SQL，不要解释，不要 Markdown
 - 金额优先 *_usd；时间用 order_date / snapshot_date / metric_date / spend_date
 - 若上方给出指标口径，必须按口径选表/字段与公式，禁止自行换算口径
@@ -150,11 +187,16 @@ class NL2SQLSkill:
         question: str,
         metric_context: str = "",
         knowledge_context: str = "",
+        *,
+        allowed_tables: set[str] | None = None,
+        role: str | None = None,
     ) -> str:
         prompt = self._build_generate_prompt(
             question,
             metric_context=metric_context,
             knowledge_context=knowledge_context,
+            allowed_tables=allowed_tables,
+            role=role,
         )
         response = invoke_llm_with_retry(
             lambda: self.llm.invoke([SystemMessage(content=prompt)]),
@@ -170,12 +212,16 @@ class NL2SQLSkill:
         error: str,
         metric_context: str = "",
         knowledge_context: str = "",
+        *,
+        allowed_tables: set[str] | None = None,
+        role: str | None = None,
     ) -> str:
+        tables = allowed_tables or ALLOWED_TABLES
         metrics_block = f"\n{metric_context}\n" if metric_context.strip() else ""
         knowledge = self._truncate_knowledge(knowledge_context)
         knowledge_block = f"\n{knowledge}\n" if knowledge else ""
         prompt = f"""上一条 SQL 执行失败，请修复为合法的单条 SELECT。
-只能查询: {", ".join(sorted(ALLOWED_TABLES))}
+只能查询: {", ".join(sorted(tables))}
 {SCHEMA_HINT}
 {metrics_block}{knowledge_block}规则: 只返回 SQL；保留原问题意图；遵守指标口径；默认 LIMIT 50；不可编造表/字段。
 
@@ -195,18 +241,24 @@ class NL2SQLSkill:
         question: str,
         metric_context: str = "",
         knowledge_context: str = "",
+        *,
+        role: str | None = None,
     ) -> NL2SQLResult:
         """端到端：生成 → 校验 → 执行 →（失败则修复一次）."""
+        tables = self._tables_for_role(role)
         result = NL2SQLResult(question=question)
         if metric_context.strip():
             result.meta["metric_context"] = metric_context
         if knowledge_context.strip():
             result.meta["knowledge_context"] = self._truncate_knowledge(knowledge_context)
+        result.meta["role"] = role or "manager"
         try:
             sql = self.generate_sql(
                 question,
                 metric_context=metric_context,
                 knowledge_context=knowledge_context,
+                allowed_tables=tables,
+                role=role,
             )
             result.sql = sql
         except LLMRetryExhaustedError as exc:
@@ -216,7 +268,9 @@ class NL2SQLSkill:
             result.error = f"SQL 生成失败: {exc}"
             return result
 
-        preview, rows = self.execute_sql(sql)
+        preview, rows = self.execute_sql(
+            sql, allowed_tables=tables, mask_role=role
+        )
         if not preview.startswith("SQL 执行失败") and not preview.startswith("错误:"):
             result.success = True
             result.rows_preview = preview
@@ -224,7 +278,6 @@ class NL2SQLSkill:
             result.meta["rows"] = rows
             return result
 
-        # 自动修复一次
         result.error = preview
         try:
             repaired = self.repair_sql(
@@ -233,10 +286,14 @@ class NL2SQLSkill:
                 preview,
                 metric_context=metric_context,
                 knowledge_context=knowledge_context,
+                allowed_tables=tables,
+                role=role,
             )
             result.sql = repaired
             result.repaired = True
-            preview2, rows2 = self.execute_sql(repaired)
+            preview2, rows2 = self.execute_sql(
+                repaired, allowed_tables=tables, mask_role=role
+            )
             if not preview2.startswith("SQL 执行失败") and not preview2.startswith("错误:"):
                 result.success = True
                 result.rows_preview = preview2

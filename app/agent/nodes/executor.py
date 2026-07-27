@@ -104,12 +104,14 @@ def _run_nl2sql_into_parts(
     metric_prompt: str,
     knowledge_context: str = "",
     matched_keys: list[str] | None = None,
+    user_role: str = "manager",
 ) -> list[dict[str, Any]]:
     try:
         outcome = get_nl2sql_skill().run(
             question,
             metric_context=metric_prompt,
             knowledge_context=knowledge_context,
+            role=user_role or "manager",
         )
         parts.append(outcome.as_context())
         if outcome.sql:
@@ -215,6 +217,7 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
             parts,
             metric_prompt=metric_prompt,
             matched_keys=metrics.matched_keys,
+            user_role=str(state.get("user_role") or "manager"),
         )
         if rows:
             sql_rows = rows
@@ -266,6 +269,7 @@ def enrich_sql_with_rag(state: AgentState) -> AgentState:
         metric_prompt=metrics.as_prompt(),
         knowledge_context=state.get("rag_context") or "",
         matched_keys=metrics.matched_keys,
+        user_role=str(state.get("user_role") or "manager"),
     )
     result = "\n\n".join(p for p in parts if p) or "暂无结构化查询结果。"
     sql_rows = rows or list(state.get("sql_rows") or [])
@@ -307,11 +311,20 @@ def _build_answer_messages(state: AgentState) -> list[SystemMessage | HumanMessa
         context_parts.append(state["rag_context"])
 
     context = "\n\n".join(context_parts) if context_parts else "暂无可用上下文。"
+    acl = ""
+    if state.get("user_role") == "user":
+        acl = (
+            "\n【权限约束】当前用户为运营组员：禁止披露采购成本、海运费率、单位成本(COGS)、"
+            "贡献利润/毛利拆解；若问题涉及此类内容，说明需运营组长权限，并给出可公开的运营建议。\n"
+        )
 
     return [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(
-            content=f"用户问题: {question}\n\n可用上下文:\n{context}\n\n请给出专业、简洁的回答。"
+            content=(
+                f"用户问题: {question}\n\n可用上下文:\n{context}{acl}\n\n"
+                "请给出专业、简洁的回答。"
+            )
         ),
     ]
 

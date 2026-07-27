@@ -11,6 +11,7 @@ class AgentState(TypedDict):
     question: str
     route: Literal["sql", "rag", "hybrid", ""]
     route_via: Literal["rule", "llm", "fallback", ""]
+    user_role: Literal["manager", "user", ""]
     metrics_context: str
     sql_result: str
     sql_rows: list[dict[str, Any]]

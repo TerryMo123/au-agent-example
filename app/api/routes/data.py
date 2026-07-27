@@ -5,11 +5,30 @@ from datetime import date
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from app.auth import (
+    AuthUser,
+    assert_data_resource_allowed,
+    get_current_user,
+    mask_sensitive_rows,
+)
 from app.db.mysql import get_db
 from app.schemas.data import DataPage, FilterOptions, OverviewResponse
 from app.services.data_query_service import DataQueryService, get_data_query_service
 
-router = APIRouter(prefix="/data", tags=["data"])
+router = APIRouter(
+    prefix="/data",
+    tags=["data"],
+    dependencies=[Depends(get_current_user)],
+)
+
+
+def _secure_page(page: DataPage, user: AuthUser) -> DataPage:
+    return DataPage(
+        items=mask_sensitive_rows(list(page.items), role=user.role),
+        total=page.total,
+        page=page.page,
+        page_size=page.page_size,
+    )
 
 
 @router.get("/filters", response_model=FilterOptions)
@@ -29,6 +48,7 @@ def get_overview(
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
 ) -> OverviewResponse:
+    # 经营总览对组员保留 GMV/销量/广告花费（日常运营需要），隐藏成本类在明细里做
     return service.overview(
         db,
         date_from=date_from,
@@ -47,14 +67,18 @@ def list_products(
     keyword: str | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_products(
-        db,
-        page=page,
-        page_size=page_size,
-        category=category,
-        status=status,
-        keyword=keyword,
+    return _secure_page(
+        service.list_products(
+            db,
+            page=page,
+            page_size=page_size,
+            category=category,
+            status=status,
+            keyword=keyword,
+        ),
+        user,
     )
 
 
@@ -70,17 +94,21 @@ def list_orders(
     keyword: str | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_orders(
-        db,
-        page=page,
-        page_size=page_size,
-        date_from=date_from,
-        date_to=date_to,
-        marketplace=marketplace,
-        site=site,
-        status=status,
-        keyword=keyword,
+    return _secure_page(
+        service.list_orders(
+            db,
+            page=page,
+            page_size=page_size,
+            date_from=date_from,
+            date_to=date_to,
+            marketplace=marketplace,
+            site=site,
+            status=status,
+            keyword=keyword,
+        ),
+        user,
     )
 
 
@@ -94,15 +122,19 @@ def list_inventory(
     below_safety: bool = False,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_inventory(
-        db,
-        page=page,
-        page_size=page_size,
-        snapshot_date=snapshot_date,
-        warehouse_code=warehouse_code,
-        product_sku=product_sku,
-        below_safety=below_safety,
+    return _secure_page(
+        service.list_inventory(
+            db,
+            page=page,
+            page_size=page_size,
+            snapshot_date=snapshot_date,
+            warehouse_code=warehouse_code,
+            product_sku=product_sku,
+            below_safety=below_safety,
+        ),
+        user,
     )
 
 
@@ -118,17 +150,21 @@ def list_returns(
     product_sku: str | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_returns(
-        db,
-        page=page,
-        page_size=page_size,
-        date_from=date_from,
-        date_to=date_to,
-        marketplace=marketplace,
-        site=site,
-        reason_code=reason_code,
-        product_sku=product_sku,
+    return _secure_page(
+        service.list_returns(
+            db,
+            page=page,
+            page_size=page_size,
+            date_from=date_from,
+            date_to=date_to,
+            marketplace=marketplace,
+            site=site,
+            reason_code=reason_code,
+            product_sku=product_sku,
+        ),
+        user,
     )
 
 
@@ -145,18 +181,22 @@ def list_ads(
     min_acos: float | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_ads(
-        db,
-        page=page,
-        page_size=page_size,
-        date_from=date_from,
-        date_to=date_to,
-        marketplace=marketplace,
-        site=site,
-        campaign_type=campaign_type,
-        product_sku=product_sku,
-        min_acos=min_acos,
+    return _secure_page(
+        service.list_ads(
+            db,
+            page=page,
+            page_size=page_size,
+            date_from=date_from,
+            date_to=date_to,
+            marketplace=marketplace,
+            site=site,
+            campaign_type=campaign_type,
+            product_sku=product_sku,
+            min_acos=min_acos,
+        ),
+        user,
     )
 
 
@@ -171,16 +211,20 @@ def list_metrics(
     product_sku: str | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_metrics(
-        db,
-        page=page,
-        page_size=page_size,
-        date_from=date_from,
-        date_to=date_to,
-        marketplace=marketplace,
-        site=site,
-        product_sku=product_sku,
+    return _secure_page(
+        service.list_metrics(
+            db,
+            page=page,
+            page_size=page_size,
+            date_from=date_from,
+            date_to=date_to,
+            marketplace=marketplace,
+            site=site,
+            product_sku=product_sku,
+        ),
+        user,
     )
 
 
@@ -195,16 +239,20 @@ def list_lifecycle(
     date_to: date | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_lifecycle(
-        db,
-        page=page,
-        page_size=page_size,
-        product_sku=product_sku,
-        batch_no=batch_no,
-        stage=stage,
-        date_from=date_from,
-        date_to=date_to,
+    return _secure_page(
+        service.list_lifecycle(
+            db,
+            page=page,
+            page_size=page_size,
+            product_sku=product_sku,
+            batch_no=batch_no,
+            stage=stage,
+            date_from=date_from,
+            date_to=date_to,
+        ),
+        user,
     )
 
 
@@ -217,14 +265,18 @@ def list_batches(
     current_status: str | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_batches(
-        db,
-        page=page,
-        page_size=page_size,
-        product_sku=product_sku,
-        current_stage=current_stage,
-        current_status=current_status,
+    return _secure_page(
+        service.list_batches(
+            db,
+            page=page,
+            page_size=page_size,
+            product_sku=product_sku,
+            current_stage=current_stage,
+            current_status=current_status,
+        ),
+        user,
     )
 
 
@@ -236,13 +288,17 @@ def list_product_status(
     scope: str | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_product_status_history(
-        db,
-        page=page,
-        page_size=page_size,
-        product_sku=product_sku,
-        scope=scope,
+    return _secure_page(
+        service.list_product_status_history(
+            db,
+            page=page,
+            page_size=page_size,
+            product_sku=product_sku,
+            scope=scope,
+        ),
+        user,
     )
 
 
@@ -255,14 +311,18 @@ def list_document_status(
     doc_type: str | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_document_status_history(
-        db,
-        page=page,
-        page_size=page_size,
-        product_sku=product_sku,
-        batch_no=batch_no,
-        doc_type=doc_type,
+    return _secure_page(
+        service.list_document_status_history(
+            db,
+            page=page,
+            page_size=page_size,
+            product_sku=product_sku,
+            batch_no=batch_no,
+            doc_type=doc_type,
+        ),
+        user,
     )
 
 
@@ -275,14 +335,19 @@ def list_freight_rates(
     date_to: date | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_freight_rates(
-        db,
-        page=page,
-        page_size=page_size,
-        lane_code=lane_code,
-        date_from=date_from,
-        date_to=date_to,
+    assert_data_resource_allowed("freight-rates", user.role)
+    return _secure_page(
+        service.list_freight_rates(
+            db,
+            page=page,
+            page_size=page_size,
+            lane_code=lane_code,
+            date_from=date_from,
+            date_to=date_to,
+        ),
+        user,
     )
 
 
@@ -298,15 +363,20 @@ def list_cost_impact(
     date_to: date | None = None,
     db: Session = Depends(get_db),
     service: DataQueryService = Depends(get_data_query_service),
+    user: AuthUser = Depends(get_current_user),
 ) -> DataPage:
-    return service.list_cost_impact(
-        db,
-        page=page,
-        page_size=page_size,
-        product_sku=product_sku,
-        phase=phase,
-        marketplace=marketplace,
-        site=site,
-        date_from=date_from,
-        date_to=date_to,
+    assert_data_resource_allowed("cost-impact", user.role)
+    return _secure_page(
+        service.list_cost_impact(
+            db,
+            page=page,
+            page_size=page_size,
+            product_sku=product_sku,
+            phase=phase,
+            marketplace=marketplace,
+            site=site,
+            date_from=date_from,
+            date_to=date_to,
+        ),
+        user,
     )

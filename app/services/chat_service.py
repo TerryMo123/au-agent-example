@@ -40,7 +40,9 @@ class ChatService:
             return stored
         return [{"role": m.role, "content": m.content} for m in request.history]
 
-    def _build_initial_state(self, request: ChatRequest) -> tuple[str, dict[str, Any]]:
+    def _build_initial_state(
+        self, request: ChatRequest, *, role: str = "manager"
+    ) -> tuple[str, dict[str, Any]]:
         session = self.sessions.get_or_create(session_id=request.session_id)
         session_id = session.session_id
         history = self._resolve_history(request, session_id)
@@ -51,6 +53,7 @@ class ChatService:
             "question": request.message,
             "route": "",
             "route_via": "",
+            "user_role": role if role in {"manager", "user"} else "manager",
             "metrics_context": "",
             "sql_result": "",
             "sql_rows": [],
@@ -186,9 +189,9 @@ class ChatService:
             ),
         )
 
-    async def chat(self, request: ChatRequest) -> ChatResponse:
+    async def chat(self, request: ChatRequest, *, role: str = "manager") -> ChatResponse:
         session_id, initial_state = await asyncio.to_thread(
-            self._build_initial_state, request
+            self._build_initial_state, request, role=role
         )
 
         hit = await asyncio.to_thread(self.qa_cache.lookup, request.message)
@@ -234,8 +237,12 @@ class ChatService:
         )
         return response
 
-    async def chat_stream(self, request: ChatRequest) -> AsyncIterator[str]:
-        session_id, state = await asyncio.to_thread(self._build_initial_state, request)
+    async def chat_stream(
+        self, request: ChatRequest, *, role: str = "manager"
+    ) -> AsyncIterator[str]:
+        session_id, state = await asyncio.to_thread(
+            self._build_initial_state, request, role=role
+        )
 
         yield format_sse("status", {"stage": "routing", "session_id": session_id})
 
