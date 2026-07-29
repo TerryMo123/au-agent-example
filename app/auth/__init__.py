@@ -6,6 +6,7 @@ from app.auth.security import (
     filter_sql_tables_for_role,
     get_current_user,
     mask_sensitive_rows,
+    require_admin,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "filter_sql_tables_for_role",
     "get_current_user",
     "mask_sensitive_rows",
+    "require_admin",
 ]

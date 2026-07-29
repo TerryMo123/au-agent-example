@@ -18,7 +18,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 from app.config import get_settings
 from app.db.mysql import Base, SessionLocal, get_db
 
-RoleName = Literal["manager", "user"]
+RoleName = Literal["admin", "manager", "user"]
 
 # 运营组员脱敏：成本、采购价、海运价、贡献利润等
 USER_MASK_FIELDS: frozenset[str] = frozenset(
@@ -51,6 +51,12 @@ USER_FORBIDDEN_SQL_TABLES: frozenset[str] = frozenset(
 )
 
 DEMO_USERS: tuple[dict[str, str], ...] = (
+    {
+        "username": "moyong-admin",
+        "password": "my123456",
+        "role": "admin",
+        "display_name": "系统管理员",
+    },
     {
         "username": "moyong-manager",
         "password": "my123456",
@@ -87,8 +93,17 @@ class AuthUser:
     display_name: str
 
     @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
+
+    @property
     def is_manager(self) -> bool:
-        return self.role == "manager"
+        """业务敏感数据权限：admin 与 manager 同级."""
+        return self.role in {"admin", "manager"}
+
+    def data_role(self) -> Literal["manager", "user"]:
+        """注入 Agent / NL2SQL 的数据角色（admin 按 manager 口径）."""
+        return "manager" if self.is_manager else "user"
 
     def to_public(self) -> dict[str, Any]:
         return {
@@ -101,6 +116,7 @@ class AuthUser:
                 "view_freight_rates": self.is_manager,
                 "view_cost_impact": self.is_manager,
                 "view_purchase_cost": self.is_manager,
+                "view_agent_trace": self.is_admin,
             },
         }
 
@@ -186,12 +202,19 @@ def authenticate(db: Session, username: str, password: str) -> AppUser | None:
     return user
 
 
+def normalize_role_name(role: str | None) -> RoleName:
+    if role == "admin":
+        return "admin"
+    if role == "manager":
+        return "manager"
+    return "user"
+
+
 def auth_user_from_row(user: AppUser) -> AuthUser:
-    role: RoleName = "manager" if user.role == "manager" else "user"
     return AuthUser(
         id=user.id,
         username=user.username,
-        role=role,
+        role=normalize_role_name(user.role),
         display_name=user.display_name or user.username,
     )
 
@@ -218,8 +241,21 @@ def get_current_user(
     return auth_user_from_row(user)
 
 
+def require_admin(user: AuthUser = Depends(get_current_user)) -> AuthUser:
+    if not user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="仅管理员可访问",
+        )
+    return user
+
+
+def _has_manager_data_access(role: RoleName | str) -> bool:
+    return role in {"admin", "manager"}
+
+
 def mask_sensitive_dict(data: dict[str, Any], *, role: RoleName) -> dict[str, Any]:
-    if role == "manager":
+    if _has_manager_data_access(role):
         return data
     out = dict(data)
     for key in list(out.keys()):
@@ -235,13 +271,13 @@ def mask_sensitive_dict(data: dict[str, Any], *, role: RoleName) -> dict[str, An
 def mask_sensitive_rows(
     rows: list[dict[str, Any]], *, role: RoleName
 ) -> list[dict[str, Any]]:
-    if role == "manager":
+    if _has_manager_data_access(role):
         return rows
     return [mask_sensitive_dict(r, role=role) for r in rows]
 
 
 def assert_data_resource_allowed(resource: str, role: RoleName) -> None:
-    if role == "manager":
+    if _has_manager_data_access(role):
         return
     if resource in USER_FORBIDDEN_DATA_RESOURCES:
         raise HTTPException(
@@ -251,6 +287,6 @@ def assert_data_resource_allowed(resource: str, role: RoleName) -> None:
 
 
 def filter_sql_tables_for_role(tables: list[str] | tuple[str, ...], role: RoleName) -> list[str]:
-    if role == "manager":
+    if _has_manager_data_access(role):
         return list(tables)
     return [t for t in tables if t not in USER_FORBIDDEN_SQL_TABLES]

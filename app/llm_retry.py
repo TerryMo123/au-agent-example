@@ -9,7 +9,9 @@ import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any, TypeVar
 
+from app.concurrency import ConcurrencyTimeoutError, llm_slot
 from app.config import get_settings
+from app.observability import observe_llm_result, observe_llm_retry
 
 logger = logging.getLogger(__name__)
 
@@ -113,39 +115,52 @@ def invoke_llm_with_retry(fn: Callable[[], T], *, operation: str = "llm_invoke")
     max_attempts = max(1, settings.llm_max_retries)
     last_error: BaseException | None = None
 
-    for attempt in range(max_attempts):
-        try:
-            return fn()
-        except Exception as exc:  # noqa: BLE001 - 需按类型分流
-            last_error = exc
-            retryable = is_retryable_llm_error(exc)
-            if not retryable or attempt >= max_attempts - 1:
-                if retryable:
-                    logger.error(
-                        "%s 重试耗尽(%s/%s): %s",
+    try:
+        with llm_slot():
+            for attempt in range(max_attempts):
+                try:
+                    result = fn()
+                    observe_llm_result(operation, "success")
+                    return result
+                except Exception as exc:  # noqa: BLE001 - 需按类型分流
+                    last_error = exc
+                    retryable = is_retryable_llm_error(exc)
+                    if not retryable or attempt >= max_attempts - 1:
+                        if retryable:
+                            logger.error(
+                                "%s 重试耗尽(%s/%s): %s",
+                                operation,
+                                attempt + 1,
+                                max_attempts,
+                                exc,
+                            )
+                            observe_llm_result(operation, "exhausted")
+                            raise LLMRetryExhaustedError(
+                                f"{operation} 在 {max_attempts} 次重试后仍失败",
+                                last_error=exc,
+                            ) from exc
+                        logger.error("%s 遇到不可重试错误: %s", operation, exc)
+                        observe_llm_result(operation, "error")
+                        raise
+
+                    observe_llm_retry(operation)
+                    delay = _backoff_seconds(attempt, settings.llm_retry_backoff_seconds)
+                    logger.warning(
+                        "%s 第 %s/%s 次失败(可重试): %s；%.2fs 后重试",
                         operation,
                         attempt + 1,
                         max_attempts,
                         exc,
+                        delay,
                     )
-                    raise LLMRetryExhaustedError(
-                        f"{operation} 在 {max_attempts} 次重试后仍失败",
-                        last_error=exc,
-                    ) from exc
-                logger.error("%s 遇到不可重试错误: %s", operation, exc)
-                raise
+                    time.sleep(delay)
+    except ConcurrencyTimeoutError as exc:
+        observe_llm_result(operation, "error")
+        raise LLMRetryExhaustedError(
+            f"{operation} 并发槽位获取超时", last_error=exc
+        ) from exc
 
-            delay = _backoff_seconds(attempt, settings.llm_retry_backoff_seconds)
-            logger.warning(
-                "%s 第 %s/%s 次失败(可重试): %s；%.2fs 后重试",
-                operation,
-                attempt + 1,
-                max_attempts,
-                exc,
-                delay,
-            )
-            time.sleep(delay)
-
+    observe_llm_result(operation, "exhausted")
     raise LLMRetryExhaustedError(
         f"{operation} 重试耗尽", last_error=last_error
     )
@@ -156,55 +171,73 @@ async def astream_llm_with_retry(
     *,
     operation: str = "llm_astream",
 ) -> AsyncIterator[Any]:
-    """流式调用：若在产出任何 token 前失败，则整体重试；已产出后失败则耗尽降级。"""
+    """流式调用：若在产出任何 token 前失败，则整体重试；已产出后失败则向上抛出."""
+    from app.concurrency import async_llm_slot
+
     settings = get_settings()
     max_attempts = max(1, settings.llm_max_retries)
     last_error: BaseException | None = None
 
-    for attempt in range(max_attempts):
-        yielded_any = False
-        try:
-            async for chunk in make_stream():
-                yielded_any = True
-                yield chunk
-            return
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            retryable = is_retryable_llm_error(exc)
+    try:
+        async with async_llm_slot():
+            for attempt in range(max_attempts):
+                yielded_any = False
+                try:
+                    async for chunk in make_stream():
+                        yielded_any = True
+                        yield chunk
+                    observe_llm_result(operation, "success")
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    retryable = is_retryable_llm_error(exc)
 
-            # 已经吐出部分内容：不再整段重试，直接视为耗尽交由上层降级补全
-            if yielded_any:
-                logger.error("%s 流式中途失败(已产出部分内容): %s", operation, exc)
-                raise LLMRetryExhaustedError(
-                    f"{operation} 流式中途失败",
-                    last_error=exc,
-                ) from exc
+                    if yielded_any:
+                        logger.error(
+                            "%s 流式中途失败(已产出部分内容): %s", operation, exc
+                        )
+                        observe_llm_result(operation, "exhausted")
+                        raise LLMRetryExhaustedError(
+                            f"{operation} 流式中途失败",
+                            last_error=exc,
+                        ) from exc
 
-            if not retryable or attempt >= max_attempts - 1:
-                if retryable:
-                    logger.error(
-                        "%s 重试耗尽(%s/%s): %s",
+                    if not retryable or attempt >= max_attempts - 1:
+                        if retryable:
+                            logger.error(
+                                "%s 重试耗尽(%s/%s): %s",
+                                operation,
+                                attempt + 1,
+                                max_attempts,
+                                exc,
+                            )
+                            observe_llm_result(operation, "exhausted")
+                            raise LLMRetryExhaustedError(
+                                f"{operation} 在 {max_attempts} 次重试后仍失败",
+                                last_error=exc,
+                            ) from exc
+                        logger.error("%s 遇到不可重试错误: %s", operation, exc)
+                        observe_llm_result(operation, "error")
+                        raise
+
+                    observe_llm_retry(operation)
+                    delay = _backoff_seconds(
+                        attempt, settings.llm_retry_backoff_seconds
+                    )
+                    logger.warning(
+                        "%s 第 %s/%s 次失败(可重试): %s；%.2fs 后重试",
                         operation,
                         attempt + 1,
                         max_attempts,
                         exc,
+                        delay,
                     )
-                    raise LLMRetryExhaustedError(
-                        f"{operation} 在 {max_attempts} 次重试后仍失败",
-                        last_error=exc,
-                    ) from exc
-                logger.error("%s 遇到不可重试错误: %s", operation, exc)
-                raise
+                    await asyncio.sleep(delay)
+    except ConcurrencyTimeoutError as exc:
+        observe_llm_result(operation, "error")
+        raise LLMRetryExhaustedError(
+            f"{operation} 并发槽位获取超时", last_error=exc
+        ) from exc
 
-            delay = _backoff_seconds(attempt, settings.llm_retry_backoff_seconds)
-            logger.warning(
-                "%s 第 %s/%s 次失败(可重试): %s；%.2fs 后重试",
-                operation,
-                attempt + 1,
-                max_attempts,
-                exc,
-                delay,
-            )
-            await asyncio.sleep(delay)
-
+    observe_llm_result(operation, "exhausted")
     raise LLMRetryExhaustedError(f"{operation} 重试耗尽", last_error=last_error)

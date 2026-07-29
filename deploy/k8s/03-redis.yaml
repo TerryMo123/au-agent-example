@@ -1,3 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: au-agent-redis
+  namespace: au-agent
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -44,7 +56,8 @@ spec:
             periodSeconds: 20
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: au-agent-redis
 ---
 apiVersion: v1
 kind: Service

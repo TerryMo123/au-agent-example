@@ -12,16 +12,32 @@ from sqlalchemy import text
 
 from app.agent.skills.schema import (
     ALLOWED_TABLES,
-    DANGEROUS_SQL_KEYWORDS,
+    DANGEROUS_SQL_PATTERN,
     FEW_SHOT_EXAMPLES,
     SCHEMA_HINT,
 )
 from app.agent.viz import serialize_rows
+from app.concurrency import ConcurrencyTimeoutError, db_slot
+from app.config import get_settings
 from app.db.mysql import SessionLocal
 from app.llm import get_chat_llm
 from app.llm_retry import LLMRetryExhaustedError, invoke_llm_with_retry
 
 logger = logging.getLogger(__name__)
+
+
+def _is_sql_timeout_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "max_execution_time",
+        "query execution was interrupted",
+        "maximum statement execution time exceeded",
+        "lost connection",
+        "timed out",
+        "timeout",
+        "read timeout",
+    )
+    return any(n in msg for n in needles)
 
 
 @dataclass
@@ -88,9 +104,9 @@ class NL2SQLSkill:
             return "仅允许 SELECT 查询"
         if ";" in normalized.rstrip(";"):
             return "不允许一次执行多条语句"
-        if any(k in normalized for k in DANGEROUS_SQL_KEYWORDS):
+        if DANGEROUS_SQL_PATTERN.search(normalized):
             return "检测到危险 SQL 关键字"
-        if not any(table in normalized for table in tables):
+        if not any(re.search(rf"\b{re.escape(table)}\b", normalized) for table in tables):
             return f"只能查询白名单表: {', '.join(sorted(tables))}"
         # 禁止表显式出现
         forbidden = ALLOWED_TABLES - tables
@@ -98,6 +114,13 @@ class NL2SQLSkill:
             if re.search(rf"\b{re.escape(t)}\b", normalized):
                 return f"当前账号无权查询表: {t}"
         return None
+
+    def ensure_limit(self, sql: str, *, limit: int = 50) -> str:
+        """无 LIMIT 时自动追加，避免全表扫描拖垮连接."""
+        cleaned = sql.strip().rstrip(";")
+        if re.search(r"\blimit\s+\d+", cleaned, flags=re.IGNORECASE):
+            return cleaned
+        return f"{cleaned} LIMIT {int(limit)}"
 
     def execute_sql(
         self,
@@ -111,22 +134,37 @@ class NL2SQLSkill:
         if err:
             return f"错误: {err}", []
 
-        db = SessionLocal()
+        bounded_sql = self.ensure_limit(sql, limit=limit)
         try:
-            result = db.execute(text(sql))
-            raw_rows = result.mappings().all()
-            if not raw_rows:
-                return "查询成功，无结果。", []
-            rows = serialize_rows([dict(r) for r in raw_rows[:limit]])
-            if mask_role == "user":
-                from app.auth.security import mask_sensitive_rows
+            with db_slot():
+                db = SessionLocal()
+                try:
+                    # 会话级再设一次，覆盖连接池复用后的遗留设置
+                    ms = int(get_settings().mysql_max_execution_time_ms or 0)
+                    if ms > 0:
+                        db.execute(text(f"SET SESSION MAX_EXECUTION_TIME={ms}"))
+                    result = db.execute(text(bounded_sql))
+                    raw_rows = result.mappings().all()
+                    if not raw_rows:
+                        return "查询成功，无结果。", []
+                    rows = serialize_rows([dict(r) for r in raw_rows[:limit]])
+                    if mask_role == "user":
+                        from app.auth.security import mask_sensitive_rows
 
-                rows = mask_sensitive_rows(rows, role="user")
-            return str(rows), rows
-        except Exception as exc:  # noqa: BLE001
+                        rows = mask_sensitive_rows(rows, role="user")
+                    return str(rows), rows
+                finally:
+                    db.close()
+        except ConcurrencyTimeoutError as exc:
             return f"SQL 执行失败: {exc}", []
-        finally:
-            db.close()
+        except Exception as exc:  # noqa: BLE001
+            if _is_sql_timeout_error(exc):
+                return (
+                    f"SQL 执行超时: {exc}。"
+                    "请缩小时间范围、减少 JOIN/聚合，或增加 LIMIT 后重试。",
+                    [],
+                )
+            return f"SQL 执行失败: {exc}", []
 
     @staticmethod
     def _truncate_knowledge(text: str, *, max_chars: int = 1800) -> str:
@@ -224,6 +262,7 @@ class NL2SQLSkill:
 只能查询: {", ".join(sorted(tables))}
 {SCHEMA_HINT}
 {metrics_block}{knowledge_block}规则: 只返回 SQL；保留原问题意图；遵守指标口径；默认 LIMIT 50；不可编造表/字段。
+若错误为超时，请显著简化：缩短时间窗口、去掉不必要 JOIN、减少聚合维度，并保留 LIMIT。
 
 用户问题: {question}
 原 SQL: {sql}
@@ -279,6 +318,9 @@ class NL2SQLSkill:
             return result
 
         result.error = preview
+        # 超时类错误：提示 repair 简化 SQL，而不是盲目重跑同等复杂度
+        if preview.startswith("SQL 执行超时"):
+            result.meta["sql_timeout"] = True
         try:
             repaired = self.repair_sql(
                 question,

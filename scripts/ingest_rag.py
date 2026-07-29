@@ -234,6 +234,27 @@ DEMO_DOCS = [
 
 def _reset_chroma_dir() -> None:
     settings = get_settings()
+    if settings.vector_backend_normalized == "http":
+        # 远程 Chroma：删除集合而非本地目录
+        import chromadb
+        from chromadb.config import Settings as ChromaSettings
+
+        client = chromadb.HttpClient(
+            host=settings.chroma_host,
+            port=int(settings.chroma_port),
+            ssl=bool(settings.chroma_ssl),
+            tenant=settings.chroma_tenant,
+            database=settings.chroma_database,
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
+        name = settings.chroma_collection_name
+        try:
+            client.delete_collection(name)
+            print(f"已删除远程集合: {name}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"删除远程集合跳过/失败（可能不存在）: {exc}")
+        return
+
     persist_dir = Path(settings.chroma_persist_dir)
     if persist_dir.exists():
         shutil.rmtree(persist_dir)
@@ -254,7 +275,10 @@ def ingest(*, force: bool = False) -> None:
             return
 
         if force and existing > 0:
-            print("清理 MySQL internal_documents 与本地 Chroma...")
+            backend = get_settings().vector_backend_normalized
+            print(
+                f"清理 MySQL internal_documents 与向量库（backend={backend}）..."
+            )
             db.query(InternalDocument).delete()
             db.commit()
             _reset_chroma_dir()

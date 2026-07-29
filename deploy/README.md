@@ -10,18 +10,19 @@
 ## 架构建议
 
 ```
-浏览器 → Ingress/NodePort → au-agent-web(×N, HPA)
+浏览器 → Ingress(TLS) → au-agent-web(×N)
                               └─ /api → au-agent-api(×1~N) → MySQL(外部)
-                                                    ├→ Redis(缓存)
-                                                    └→ Chroma PVC
+                                                    ├→ Redis(PVC/缓存+限流)
+                                                    └→ Chroma local PVC 或 Chroma Server
 ```
 
 | 组件 | 是否可多副本 | 说明 |
 |------|-------------|------|
 | Web | 是 | 无状态，优先做负载均衡 |
-| API | 视 Chroma 而定 | 本地 Chroma + RWO PVC 时建议 **1 副本**；有 NFS/RWX 或外部向量库后再水平扩展 |
-| Redis | 1（示例） | 语义缓存共享；生产可换云 Redis |
-| MySQL | 外部 | 你当前已有远端库，K8s 内只配连接信息 |
+| API | 视向量库而定 | `VECTOR_BACKEND=local` + RWO 时建议 **1 副本**；`http` 远程 Chroma 或 RWX 后可 HPA |
+| Redis | 1（示例） | 语义缓存 + 限流；已用 PVC 持久化 AOF |
+| Chroma | 1（Server） | `10-chroma.yaml`；API 无状态后可水平扩展 |
+| MySQL | 外部 | 远端库，K8s 内只配连接信息 |
 
 ## 0. 前置条件
 
@@ -96,20 +97,34 @@ kubectl -n au-agent exec -it deploy/au-agent-api -- python scripts/ingest_rag.py
 - Ingress：`http://au-agent.example.com`（DNS 指到 Ingress）
 - NodePort：`http://任意节点IP:30080`
 
-## 4. 负载均衡怎么落地
+## 4. 负载均衡 / 水平扩展 / TLS
 
-1. **入口层**：Ingress Controller 对 `au-agent-web` 做多 Pod 轮询（已配 HPA min=2）。
-2. **应用层**：Web → Service `au-agent-api`；当前 API `replicas: 1`，避免 RWO Chroma 多挂载冲突。
-3. **扩 API**：把 PVC 换成 **ReadWriteMany**，`05-api.yaml` 里 `replicas` 调高、`strategy` 改为 `RollingUpdate`，再启用 `06-api-hpa.yaml`。
-4. **SSE**：Ingress / Nginx 已关缓冲、超时 3600s，避免流式对话被截断。
+1. **入口层**：Ingress Controller 对 `au-agent-web` 做多 Pod 轮询。
+2. **默认 API**：本地 Chroma + RWO PVC → `replicas: 1`（`05-api.yaml`）。
+3. **推荐扩 API（无状态）**：
+   ```bash
+   kubectl apply -f deploy/k8s/10-chroma.yaml
+   # ConfigMap 设 VECTOR_BACKEND=http, CHROMA_HOST=au-agent-chroma
+   kubectl apply -f deploy/k8s/05-api-stateless.yaml
+   kubectl apply -f deploy/k8s/06-api-hpa.yaml
+   ```
+4. **Docker Compose 无状态验证**：
+   ```bash
+   docker compose -f docker-compose.prod.yml -f docker-compose.chroma.yml up -d --build
+   ```
+5. **HTTPS**：使用 `08-ingress-tls.yaml`（需 cert-manager + ClusterIssuer），或在 `08-ingress.yaml` 填入已有 TLS Secret。
+6. **限流**：ConfigMap / `.env.prod` 中 `RATE_LIMIT_ENABLED=true`（按用户 + IP，优先 Redis）。
+7. **SSE**：Ingress / Nginx 已关缓冲、超时 3600s。
 
 ## 5. 运维常用命令
 
 ```bash
 kubectl -n au-agent logs -f deploy/au-agent-api
 kubectl -n au-agent rollout restart deploy/au-agent-api
-kubectl -n au-agent describe pvc au-agent-chroma
+kubectl -n au-agent describe pvc au-agent-redis au-agent-chroma au-agent-chroma-server
 kubectl -n au-agent top pods   # 需 metrics-server
+curl -s http://127.0.0.1:8000/api/v1/ready
+curl -s http://127.0.0.1:8000/metrics | head
 ```
 
 ## 6. 常见问题
@@ -120,11 +135,14 @@ kubectl -n au-agent top pods   # 需 metrics-server
 | Pod Pending（PVC） | 确认集群有默认 StorageClass |
 | 聊天无流式输出 | 确认走的是 Web 的 `/api` 反代，且 Ingress 关闭了 proxy-buffering |
 | 知识库空 | 在 API Pod 内执行 `scripts/ingest_rag.py` |
-| 多 API 副本异常 | Chroma RWO 不支持多挂，保持 1 副本或换 RWX |
+| 多 API 副本异常 | 本地 Chroma RWO 不支持多挂；改 `VECTOR_BACKEND=http` + `10-chroma.yaml` |
+| 429 过多 | 调大 `RATE_LIMIT_CHAT_PER_MINUTE` / `RATE_LIMIT_IP_PER_MINUTE` |
+| Redis 重启丢缓存 | 已改 PVC（`03-redis.yaml`）；勿用 emptyDir |
 
 ## 7. 推荐上线顺序
 
 1. Compose 在单机跑通（健康检查 + 一次完整问答）
 2. 镜像推仓库 → K8s 单副本 API + 双副本 Web + NodePort
-3. 配 Ingress / 域名 / HTTPS
-4. 开语义缓存 Redis，观察资源后再考虑 API 水平扩展
+3. 配 Ingress / 域名 / HTTPS（`08-ingress-tls.yaml`）
+4. 开语义缓存 Redis + 限流，观察资源
+5. 切远程 Chroma → 无状态 API → 启用 HPA

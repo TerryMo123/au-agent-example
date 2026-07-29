@@ -1,5 +1,7 @@
 """傲基业务库 Schema 与 NL2SQL 提示素材."""
 
+import re
+
 ALLOWED_TABLES = {
     "products",
     "marketplace_listings",
@@ -91,4 +93,15 @@ DANGEROUS_SQL_KEYWORDS = (
     "replace",
     "grant",
     "revoke",
+    "into",
+    "outfile",
+    "dumpfile",
+    "load_file",
+    "information_schema",
+)
+
+# 词边界匹配，避免 created_at / updated_at 等列名误伤
+DANGEROUS_SQL_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in DANGEROUS_SQL_KEYWORDS) + r")\b",
+    re.IGNORECASE,
 )

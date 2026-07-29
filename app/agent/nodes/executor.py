@@ -298,7 +298,48 @@ def retrieve_rag_context(state: AgentState) -> AgentState:
     return {**state, "rag_context": context, "sources": sources}
 
 
-def _build_answer_messages(state: AgentState) -> list[SystemMessage | HumanMessage]:
+def _truncate_text(text: str, max_chars: int) -> str:
+    cleaned = (text or "").strip()
+    if max_chars <= 0 or len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 1] + "…"
+
+
+def _prior_history_messages(state: AgentState) -> list[SystemMessage | HumanMessage | AIMessage]:
+    """从 state.messages 取出当前问题之前的最近若干轮，供最终生成使用."""
+    from app.config import get_settings
+
+    settings = get_settings()
+    max_n = max(0, int(settings.answer_history_messages))
+    max_chars = max(64, int(settings.answer_history_max_chars))
+    if max_n <= 0:
+        return []
+
+    raw = list(state.get("messages") or [])
+    question = (state.get("question") or "").strip()
+    # 去掉末尾当前用户问题，避免与下面的 HumanMessage 重复
+    if raw:
+        last = raw[-1]
+        last_content = getattr(last, "content", "")
+        if isinstance(last, HumanMessage) and str(last_content).strip() == question:
+            raw = raw[:-1]
+
+    selected = raw[-max_n:]
+    out: list[SystemMessage | HumanMessage | AIMessage] = []
+    for msg in selected:
+        content = _truncate_text(str(getattr(msg, "content", "") or ""), max_chars)
+        if not content:
+            continue
+        if isinstance(msg, AIMessage):
+            out.append(AIMessage(content=content))
+        elif isinstance(msg, SystemMessage):
+            out.append(SystemMessage(content=content))
+        else:
+            out.append(HumanMessage(content=content))
+    return out
+
+
+def _build_answer_messages(state: AgentState) -> list[SystemMessage | HumanMessage | AIMessage]:
     question = state["question"]
     route = state.get("route", "hybrid")
 
@@ -318,15 +359,20 @@ def _build_answer_messages(state: AgentState) -> list[SystemMessage | HumanMessa
             "贡献利润/毛利拆解；若问题涉及此类内容，说明需运营组长权限，并给出可公开的运营建议。\n"
         )
 
-    return [
+    messages: list[SystemMessage | HumanMessage | AIMessage] = [
         SystemMessage(content=SYSTEM_PROMPT),
+    ]
+    messages.extend(_prior_history_messages(state))
+    messages.append(
         HumanMessage(
             content=(
                 f"用户问题: {question}\n\n可用上下文:\n{context}{acl}\n\n"
-                "请给出专业、简洁的回答。"
+                "请结合对话历史与上下文给出专业、简洁的回答；"
+                "若问题依赖上文（如「刚才那个 SKU」「换成近 30 天」），必须正确承接。"
             )
-        ),
-    ]
+        )
+    )
+    return messages
 
 
 def generate_answer(state: AgentState) -> AgentState:
@@ -364,7 +410,12 @@ def generate_answer(state: AgentState) -> AgentState:
 
 
 async def stream_answer_tokens(state: AgentState):
-    """流式生成回答 token；API 瞬时错误会重试，耗尽则产出降级文案。"""
+    """流式生成回答 token。
+
+    未产出任何内容前失败：由 astream_llm_with_retry 重试；耗尽后抛出。
+    已产出部分内容后失败：向上抛出，由 ChatService 发 error + done.degraded，
+    **不再**把 FALLBACK 拼进正文。
+    """
     llm = _get_llm()
     messages = _build_answer_messages(state)
 
@@ -382,14 +433,7 @@ async def stream_answer_tokens(state: AgentState):
                         if text:
                             yield text
 
-    try:
-        async for token in astream_llm_with_retry(
-            _extract_chunks, operation="stream_answer_tokens"
-        ):
-            yield token
-    except LLMRetryExhaustedError as exc:
-        logger.warning("流式生成重试耗尽，降级输出固定文案: %s", exc)
-        yield FALLBACK_ANSWER
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("流式生成失败，降级输出固定文案: %s", exc)
-        yield FALLBACK_ANSWER
+    async for token in astream_llm_with_retry(
+        _extract_chunks, operation="stream_answer_tokens"
+    ):
+        yield token

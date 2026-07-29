@@ -1,4 +1,4 @@
-# 仅当 Chroma 使用 RWX（或改为无状态/外部向量库）后启用 HPA
+# 仅当 API 无状态（VECTOR_BACKEND=http + 05-api-stateless）或 Chroma 使用 RWX 后启用
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -9,8 +9,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: au-agent-api
-  minReplicas: 1
-  maxReplicas: 4
+  minReplicas: 2
+  maxReplicas: 6
   metrics:
     - type: Resource
       resource:

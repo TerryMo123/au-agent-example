@@ -1,5 +1,5 @@
-# 需要集群已安装 Ingress Controller（nginx / traefik 等）
-# HTTP 入口；生产 HTTPS 请用 08-ingress-tls.yaml
+# TLS Ingress（需集群已装 cert-manager，并创建 ClusterIssuer）
+# 示例：kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.0/cert-manager.yaml
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -11,10 +11,13 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
-    # 可选：强制跳转 HTTPS（配合 TLS Ingress / 证书）
-    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
   ingressClassName: nginx
+  tls:
+    - hosts:
+        - au-agent.example.com
+      secretName: au-agent-tls
   rules:
     - host: au-agent.example.com
       http:
@@ -26,8 +29,3 @@ spec:
                 name: au-agent-web
                 port:
                   number: 80
-  # 手动证书也可：
-  # tls:
-  #   - hosts:
-  #       - au-agent.example.com
-  #     secretName: au-agent-tls

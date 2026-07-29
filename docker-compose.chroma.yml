@@ -1,0 +1,39 @@
+# 叠加启用远程 Chroma，使 API 无状态（可多副本）
+# 用法：
+#   docker compose -f docker-compose.prod.yml -f docker-compose.chroma.yml up -d --build
+#
+# .env.prod 建议包含：
+#   VECTOR_BACKEND=http
+#   CHROMA_HOST=chroma
+#   CHROMA_PORT=8000
+
+services:
+  chroma:
+    image: chromadb/chroma:0.5.23
+    restart: unless-stopped
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - chroma_server_data:/chroma/chroma
+    expose:
+      - "8000"
+
+  au-agent-api:
+    environment:
+      VECTOR_BACKEND: http
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      CHROMA_SSL: "false"
+    depends_on:
+      redis:
+        condition: service_started
+      chroma:
+        condition: service_started
+    # 覆盖本地 chroma 挂载：用空 tmpfs，实际读写走远程 Chroma
+    volumes:
+      - type: tmpfs
+        target: /app/data/chroma
+
+volumes:
+  chroma_server_data:
