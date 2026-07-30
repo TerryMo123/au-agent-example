@@ -3,8 +3,8 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from app.agent.routing import decide_route
-from app.agent.state import AgentState
+from app.agent.routing import decide_route, scan_route_signals
+from app.agent.state import AgentState, append_trace_action
 from app.agent.skills import (
     get_ad_diagnosis_skill,
     get_inventory_alert_skill,
@@ -66,12 +66,82 @@ def _content_text(response: Any) -> str:
 
 
 def route_question(state: AgentState) -> AgentState:
-    """规则优先路由；未命中再用小模型."""
-    decision = decide_route(state["question"])
+    """规则优先路由；未命中再用小模型. 同步写入细粒度轨迹."""
+    question = state["question"]
+    signals = scan_route_signals(question)
+    actions = append_trace_action(
+        state,
+        {
+            "id": "route_rule_scan",
+            "label": "规则信号扫描",
+            "status": "ok",
+            "detail": {
+                "sql_hits": signals["sql_hits"][:12],
+                "rag_hits": signals["rag_hits"][:12],
+                "hybrid_hits": signals["hybrid_hits"][:8],
+            },
+        },
+    )
+    decision = decide_route(question)
+    if decision.rule_matched:
+        actions = append_trace_action(
+            {**state, "trace_actions": actions},
+            {
+                "id": "route_rule_hit",
+                "label": f"命中路由规则 → {decision.route}",
+                "status": "ok",
+                "detail": {
+                    "route": decision.route,
+                    "via": decision.via,
+                    "reason": decision.reason,
+                    "sql_hits": list(decision.sql_hits)[:12],
+                    "rag_hits": list(decision.rag_hits)[:12],
+                    "hybrid_hits": list(decision.hybrid_hits)[:8],
+                    "llm_invoked": False,
+                },
+            },
+        )
+    else:
+        llm_status = "ok" if decision.via == "llm" else "error"
+        actions = append_trace_action(
+            {**state, "trace_actions": actions},
+            {
+                "id": "route_llm_classify",
+                "label": "小模型意图分类",
+                "status": llm_status if decision.via != "fallback" else "error",
+                "detail": {
+                    "invoked": True,
+                    "via": decision.via,
+                    "route": decision.route,
+                    "reason": decision.reason,
+                    "raw_preview": (decision.llm_raw or "")[:240],
+                },
+            },
+        )
+        if decision.via == "fallback":
+            actions = append_trace_action(
+                {**state, "trace_actions": actions},
+                {
+                    "id": "route_fallback",
+                    "label": "路由兜底 → hybrid",
+                    "status": "error",
+                    "detail": {
+                        "reason": decision.reason,
+                        "fallback_route": "hybrid",
+                    },
+                },
+            )
+
     return {
         **state,
         "route": decision.route,
         "route_via": decision.via,
+        "route_reason": decision.reason,
+        "route_sql_hits": list(decision.sql_hits),
+        "route_rag_hits": list(decision.rag_hits),
+        "route_hybrid_hits": list(decision.hybrid_hits),
+        "route_llm_invoked": bool(decision.llm_invoked),
+        "trace_actions": actions,
     }
 
 
@@ -105,7 +175,14 @@ def _run_nl2sql_into_parts(
     knowledge_context: str = "",
     matched_keys: list[str] | None = None,
     user_role: str = "manager",
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    meta: dict[str, Any] = {
+        "success": False,
+        "repaired": False,
+        "row_count": 0,
+        "sql_preview": "",
+        "error": None,
+    }
     try:
         outcome = get_nl2sql_skill().run(
             question,
@@ -114,6 +191,10 @@ def _run_nl2sql_into_parts(
             role=user_role or "manager",
         )
         parts.append(outcome.as_context())
+        meta["success"] = bool(outcome.success)
+        meta["repaired"] = bool(outcome.repaired)
+        meta["row_count"] = len(outcome.rows or [])
+        meta["sql_preview"] = (outcome.sql or "")[:240]
         if outcome.sql:
             logger.info(
                 "NL2SQL sql=%s success=%s repaired=%s metrics=%s knowledge=%s rows=%s",
@@ -124,16 +205,18 @@ def _run_nl2sql_into_parts(
                 bool(knowledge_context.strip()),
                 len(outcome.rows),
             )
-        return list(outcome.rows or [])
+        return list(outcome.rows or []), meta
     except LLMRetryExhaustedError as exc:
         logger.warning("NL2SQL LLM 重试耗尽，降级跳过结构化查询: %s", exc)
         parts.append(
             "结构化查询暂不可用：模型服务多次重试仍失败，本次已跳过 SQL 检索。"
         )
+        meta["error"] = f"llm_retry_exhausted:{exc}"
     except Exception as exc:  # noqa: BLE001
         logger.warning("NL2SQL 失败，降级跳过: %s", exc)
         parts.append(f"结构化查询暂不可用：{exc}")
-    return []
+        meta["error"] = str(exc)
+    return [], meta
 
 
 def retrieve_sql_context(state: AgentState) -> AgentState:
@@ -142,9 +225,21 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
     hybrid 路由下推迟 NL2SQL，等 RAG 并行完成后由 enrich_sql_with_rag 注入知识再生成。
     """
     question = state["question"]
+    actions = list(state.get("trace_actions") or [])
     metrics = get_metrics_dictionary_skill().resolve(question)
     metrics_context = metrics.as_context()
     metric_prompt = metrics.as_prompt()
+    actions.append(
+        {
+            "id": "skill_metrics",
+            "label": "指标口径对齐",
+            "status": "ok" if metrics.matched_keys else "skipped",
+            "detail": {
+                "matched_keys": list(metrics.matched_keys or [])[:12],
+                "has_context": bool(metrics_context.strip()),
+            },
+        }
+    )
 
     parts: list[str] = []
     sql_rows: list[dict[str, Any]] = list(state.get("sql_rows") or [])
@@ -159,6 +254,18 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
             alert_text = alert.as_context()
             if alert_text:
                 parts.append(alert_text)
+            actions.append(
+                {
+                    "id": "skill_inventory_alert",
+                    "label": "库存预警 Skill",
+                    "status": "error" if alert.error else "ok",
+                    "detail": {
+                        "matched": True,
+                        "item_count": len(alert.items),
+                        "error": alert.error,
+                    },
+                }
+            )
             logger.info(
                 "库存预警 matched items=%s error=%s",
                 len(alert.items),
@@ -166,6 +273,23 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("库存预警失败: %s", exc)
+            actions.append(
+                {
+                    "id": "skill_inventory_alert",
+                    "label": "库存预警 Skill",
+                    "status": "error",
+                    "detail": {"matched": True, "error": str(exc)},
+                }
+            )
+    else:
+        actions.append(
+            {
+                "id": "skill_inventory_alert",
+                "label": "库存预警 Skill",
+                "status": "skipped",
+                "detail": {"matched": False},
+            }
+        )
 
     ad_skill = get_ad_diagnosis_skill()
     ad_matched = ad_skill.matches(question)
@@ -176,6 +300,18 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
             text = diagnosis.as_context()
             if text:
                 parts.append(text)
+            actions.append(
+                {
+                    "id": "skill_ad_diagnosis",
+                    "label": "广告诊断 Skill",
+                    "status": "error" if diagnosis.error else "ok",
+                    "detail": {
+                        "matched": True,
+                        "item_count": len(diagnosis.items),
+                        "error": diagnosis.error,
+                    },
+                }
+            )
             logger.info(
                 "广告诊断 matched items=%s error=%s",
                 len(diagnosis.items),
@@ -183,6 +319,23 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("广告诊断失败: %s", exc)
+            actions.append(
+                {
+                    "id": "skill_ad_diagnosis",
+                    "label": "广告诊断 Skill",
+                    "status": "error",
+                    "detail": {"matched": True, "error": str(exc)},
+                }
+            )
+    else:
+        actions.append(
+            {
+                "id": "skill_ad_diagnosis",
+                "label": "广告诊断 Skill",
+                "status": "skipped",
+                "detail": {"matched": False},
+            }
+        )
 
     return_skill = get_return_attribution_skill()
     return_matched = return_skill.matches(question)
@@ -193,6 +346,18 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
             text = attribution.as_context()
             if text:
                 parts.append(text)
+            actions.append(
+                {
+                    "id": "skill_return_attribution",
+                    "label": "退货归因 Skill",
+                    "status": "error" if attribution.error else "ok",
+                    "detail": {
+                        "matched": True,
+                        "reason_count": len(attribution.reasons),
+                        "error": attribution.error,
+                    },
+                }
+            )
             logger.info(
                 "退货归因 matched reasons=%s error=%s",
                 len(attribution.reasons),
@@ -200,6 +365,23 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("退货归因失败: %s", exc)
+            actions.append(
+                {
+                    "id": "skill_return_attribution",
+                    "label": "退货归因 Skill",
+                    "status": "error",
+                    "detail": {"matched": True, "error": str(exc)},
+                }
+            )
+    else:
+        actions.append(
+            {
+                "id": "skill_return_attribution",
+                "label": "退货归因 Skill",
+                "status": "skipped",
+                "detail": {"matched": False},
+            }
+        )
 
     run_nl2sql = _should_run_nl2sql(
         question,
@@ -212,7 +394,7 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
     defer_nl2sql = state.get("route") == "hybrid"
 
     if run_nl2sql and not defer_nl2sql:
-        rows = _run_nl2sql_into_parts(
+        rows, nl_meta = _run_nl2sql_into_parts(
             question,
             parts,
             metric_prompt=metric_prompt,
@@ -221,6 +403,42 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
         )
         if rows:
             sql_rows = rows
+        actions.append(
+            {
+                "id": "skill_nl2sql",
+                "label": "NL2SQL 生成与执行",
+                "status": "error" if nl_meta.get("error") else "ok",
+                "detail": {
+                    "deferred": False,
+                    "metrics": list(metrics.matched_keys or [])[:8],
+                    **nl_meta,
+                },
+            }
+        )
+    elif defer_nl2sql and run_nl2sql:
+        actions.append(
+            {
+                "id": "skill_nl2sql",
+                "label": "NL2SQL（hybrid 延后至 Enrich）",
+                "status": "skipped",
+                "detail": {"deferred": True, "reason": "wait_rag_enrich"},
+            }
+        )
+    else:
+        actions.append(
+            {
+                "id": "skill_nl2sql",
+                "label": "NL2SQL 生成与执行",
+                "status": "skipped",
+                "detail": {
+                    "deferred": False,
+                    "reason": "covered_by_specialized_skill",
+                    "inventory": inventory_matched,
+                    "ad": ad_matched,
+                    "return": return_matched,
+                },
+            }
+        )
 
     result = "\n\n".join(p for p in parts if p) or (
         "暂无结构化查询结果。" if not defer_nl2sql else ""
@@ -232,6 +450,7 @@ def retrieve_sql_context(state: AgentState) -> AgentState:
         "sql_result": result,
         "sql_rows": sql_rows,
         "visualizations": visualizations,
+        "trace_actions": actions,
     }
 
 
@@ -241,6 +460,7 @@ def enrich_sql_with_rag(state: AgentState) -> AgentState:
         return state
 
     question = state["question"]
+    actions = list(state.get("trace_actions") or [])
     inventory_matched = get_inventory_alert_skill().matches(question)
     ad_matched = get_ad_diagnosis_skill().matches(question)
     return_matched = get_return_attribution_skill().matches(question)
@@ -253,9 +473,21 @@ def enrich_sql_with_rag(state: AgentState) -> AgentState:
         used_specialized=used_specialized,
     ):
         # 专项已覆盖且无额外结构化诉求
+        actions.append(
+            {
+                "id": "enrich_nl2sql",
+                "label": "Hybrid Enrich：跳过 NL2SQL",
+                "status": "skipped",
+                "detail": {"reason": "covered_by_specialized_skill"},
+            }
+        )
         if not (state.get("sql_result") or "").strip():
-            return {**state, "sql_result": "暂无结构化查询结果。"}
-        return state
+            return {
+                **state,
+                "sql_result": "暂无结构化查询结果。",
+                "trace_actions": actions,
+            }
+        return {**state, "trace_actions": actions}
 
     metrics = get_metrics_dictionary_skill().resolve(question)
     parts: list[str] = []
@@ -263,7 +495,7 @@ def enrich_sql_with_rag(state: AgentState) -> AgentState:
     if existing:
         parts.append(existing)
 
-    rows = _run_nl2sql_into_parts(
+    rows, nl_meta = _run_nl2sql_into_parts(
         question,
         parts,
         metric_prompt=metrics.as_prompt(),
@@ -274,28 +506,70 @@ def enrich_sql_with_rag(state: AgentState) -> AgentState:
     result = "\n\n".join(p for p in parts if p) or "暂无结构化查询结果。"
     sql_rows = rows or list(state.get("sql_rows") or [])
     visualizations = build_visualizations(sql_rows, question=question) if sql_rows else []
+    actions.append(
+        {
+            "id": "enrich_nl2sql",
+            "label": "Hybrid Enrich：知识注入后 NL2SQL",
+            "status": "error" if nl_meta.get("error") else "ok",
+            "detail": {
+                "has_rag_context": bool((state.get("rag_context") or "").strip()),
+                "metrics": list(metrics.matched_keys or [])[:8],
+                **nl_meta,
+            },
+        }
+    )
     return {
         **state,
         "metrics_context": state.get("metrics_context") or metrics.as_context(),
         "sql_result": result,
         "sql_rows": sql_rows,
         "visualizations": visualizations,
+        "trace_actions": actions,
     }
 
 
 def retrieve_rag_context(state: AgentState) -> AgentState:
     """通过 RAG Skill：类目路由 + 多路召回 + 重排 + 引用溯源."""
     question = state["question"]
+    actions = list(state.get("trace_actions") or [])
     try:
         outcome = get_rag_skill().retrieve(question, top_k=4)
         context = outcome.as_context()
         sources = outcome.as_sources()
+        actions.append(
+            {
+                "id": "retrieve_rag",
+                "label": "RAG 知识检索",
+                "status": "ok",
+                "detail": {
+                    "source_count": len(sources),
+                    "titles": [
+                        str(s.get("title") or s.get("category") or "")[:40]
+                        for s in sources[:5]
+                    ],
+                    "has_context": bool((context or "").strip()),
+                },
+            }
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("RAG 检索失败，降级为空上下文: %s", exc)
         context = "内部知识检索暂不可用。"
         sources = []
+        actions.append(
+            {
+                "id": "retrieve_rag",
+                "label": "RAG 知识检索",
+                "status": "error",
+                "detail": {"error": str(exc), "degraded": True},
+            }
+        )
 
-    return {**state, "rag_context": context, "sources": sources}
+    return {
+        **state,
+        "rag_context": context,
+        "sources": sources,
+        "trace_actions": actions,
+    }
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -377,8 +651,11 @@ def _build_answer_messages(state: AgentState) -> list[SystemMessage | HumanMessa
 
 def generate_answer(state: AgentState) -> AgentState:
     """汇总上下文生成最终回答."""
+    actions = list(state.get("trace_actions") or [])
     llm = _get_llm()
     messages = _build_answer_messages(state)
+    gen_status = "ok"
+    gen_error: str | None = None
     try:
         response = invoke_llm_with_retry(
             lambda: llm.invoke(messages),
@@ -388,9 +665,13 @@ def generate_answer(state: AgentState) -> AgentState:
     except LLMRetryExhaustedError as exc:
         logger.warning("最终生成 LLM 重试耗尽，返回降级文案: %s", exc)
         answer = FALLBACK_ANSWER
+        gen_status = "error"
+        gen_error = f"llm_retry_exhausted:{exc}"
     except Exception as exc:  # noqa: BLE001
         logger.warning("最终生成失败，返回降级文案: %s", exc)
         answer = FALLBACK_ANSWER
+        gen_status = "error"
+        gen_error = str(exc)
 
     clean_answer, answer_viz = parse_answer_visualizations(answer)
     auto_viz = list(state.get("visualizations") or [])
@@ -399,13 +680,30 @@ def generate_answer(state: AgentState) -> AgentState:
             state.get("sql_rows") or [], question=state.get("question") or ""
         )
     visualizations = merge_visualizations(auto_viz, answer_viz)
+    final_answer = clean_answer or answer
+    actions.append(
+        {
+            "id": "generate",
+            "label": "答案生成",
+            "status": gen_status,
+            "detail": {
+                "answer_chars": len(final_answer or ""),
+                "has_sql": bool(state.get("sql_result")),
+                "has_rag": bool(state.get("rag_context")),
+                "degraded": gen_status == "error",
+                "error": gen_error,
+                "viz_count": len(visualizations),
+            },
+        }
+    )
 
     return {
         **state,
-        "answer": clean_answer or answer,
+        "answer": final_answer,
         "visualizations": visualizations,
+        "trace_actions": actions,
         "messages": state.get("messages", [])
-        + [AIMessage(content=clean_answer or answer)],
+        + [AIMessage(content=final_answer)],
     }
 
 

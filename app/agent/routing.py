@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_core.messages import SystemMessage
 
@@ -132,7 +132,27 @@ class RouteDecision:
     via: RouteVia
     sql_hits: tuple[str, ...] = ()
     rag_hits: tuple[str, ...] = ()
+    hybrid_hits: tuple[str, ...] = ()
     reason: str = ""
+    rule_matched: bool = False
+    llm_invoked: bool = False
+    llm_raw: str = ""
+
+
+def scan_route_signals(question: str) -> dict[str, Any]:
+    """仅扫描信号，不落最终路由（供轨迹展示）."""
+    q = _normalize(question)
+    hybrid_hits = _hits(q, _HYBRID_SIGNALS)
+    sql_hits = _hits(q, _SQL_SIGNALS)
+    rag_hits = _hits(q, _RAG_SIGNALS)
+    sql_hits = _drop_dominated(sql_hits, rag_hits)
+    rag_hits = _drop_dominated(rag_hits, sql_hits)
+    return {
+        "normalized": q[:200],
+        "sql_hits": list(sql_hits),
+        "rag_hits": list(rag_hits),
+        "hybrid_hits": list(hybrid_hits),
+    }
 
 
 def _normalize(question: str) -> str:
@@ -176,6 +196,7 @@ def rule_route(question: str) -> RouteDecision | None:
             route="hybrid",
             via="rule",
             reason="empty_question",
+            rule_matched=True,
         )
 
     hybrid_hits = _hits(q, _HYBRID_SIGNALS)
@@ -191,7 +212,9 @@ def rule_route(question: str) -> RouteDecision | None:
             via="rule",
             sql_hits=sql_hits,
             rag_hits=rag_hits,
+            hybrid_hits=hybrid_hits,
             reason=f"hybrid_signal:{hybrid_hits[0]}",
+            rule_matched=True,
         )
 
     has_sql = bool(sql_hits)
@@ -203,7 +226,9 @@ def rule_route(question: str) -> RouteDecision | None:
             via="rule",
             sql_hits=sql_hits,
             rag_hits=rag_hits,
+            hybrid_hits=(),
             reason="sql_and_rag",
+            rule_matched=True,
         )
     if has_sql:
         return RouteDecision(
@@ -212,6 +237,7 @@ def rule_route(question: str) -> RouteDecision | None:
             sql_hits=sql_hits,
             rag_hits=(),
             reason=f"sql:{sql_hits[0]}",
+            rule_matched=True,
         )
     if has_rag:
         return RouteDecision(
@@ -220,6 +246,7 @@ def rule_route(question: str) -> RouteDecision | None:
             sql_hits=(),
             rag_hits=rag_hits,
             reason=f"rag:{rag_hits[0]}",
+            rule_matched=True,
         )
     return None
 
@@ -240,6 +267,7 @@ def _parse_route_json(content: str) -> RouteName | None:
 
 def llm_route(question: str) -> RouteDecision:
     """小模型兜底路由."""
+    signals = scan_route_signals(question)
     llm = get_router_llm()
     prompt = f"""分析用户问题，判断最适合的数据来源。
 只返回 JSON: {{"route": "sql" | "rag" | "hybrid"}}
@@ -261,13 +289,55 @@ def llm_route(question: str) -> RouteDecision:
             content = str(content)
         route = _parse_route_json(content)
         if route:
-            return RouteDecision(route=route, via="llm", reason="llm_ok")
+            return RouteDecision(
+                route=route,
+                via="llm",
+                sql_hits=tuple(signals["sql_hits"]),
+                rag_hits=tuple(signals["rag_hits"]),
+                hybrid_hits=tuple(signals["hybrid_hits"]),
+                reason="llm_ok",
+                rule_matched=False,
+                llm_invoked=True,
+                llm_raw=content[:500],
+            )
         logger.warning("路由小模型返回无法解析，降级 hybrid: %s", content[:200])
+        return RouteDecision(
+            route="hybrid",
+            via="fallback",
+            sql_hits=tuple(signals["sql_hits"]),
+            rag_hits=tuple(signals["rag_hits"]),
+            hybrid_hits=tuple(signals["hybrid_hits"]),
+            reason="llm_parse_failed",
+            rule_matched=False,
+            llm_invoked=True,
+            llm_raw=content[:500],
+        )
     except LLMRetryExhaustedError as exc:
         logger.warning("路由小模型重试耗尽，降级 hybrid: %s", exc)
+        return RouteDecision(
+            route="hybrid",
+            via="fallback",
+            sql_hits=tuple(signals["sql_hits"]),
+            rag_hits=tuple(signals["rag_hits"]),
+            hybrid_hits=tuple(signals["hybrid_hits"]),
+            reason="llm_retry_exhausted",
+            rule_matched=False,
+            llm_invoked=True,
+            llm_raw=str(exc)[:300],
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("路由小模型失败，降级 hybrid: %s", exc)
-    return RouteDecision(route="hybrid", via="fallback", reason="llm_failed")
+        return RouteDecision(
+            route="hybrid",
+            via="fallback",
+            sql_hits=tuple(signals["sql_hits"]),
+            rag_hits=tuple(signals["rag_hits"]),
+            hybrid_hits=tuple(signals["hybrid_hits"]),
+            reason="llm_exception",
+            rule_matched=False,
+            llm_invoked=True,
+            llm_raw=str(exc)[:300],
+        )
 
 
 def decide_route(question: str) -> RouteDecision:

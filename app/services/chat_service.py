@@ -81,6 +81,11 @@ class ChatService:
             "question": request.message,
             "route": "",
             "route_via": "",
+            "route_reason": "",
+            "route_sql_hits": [],
+            "route_rag_hits": [],
+            "route_hybrid_hits": [],
+            "route_llm_invoked": False,
             "user_role": role,
             "metrics_context": "",
             "sql_result": "",
@@ -89,6 +94,7 @@ class ChatService:
             "sources": [],
             "answer": "",
             "visualizations": [],
+            "trace_actions": [],
         }
         return session_id, initial_state, is_follow_up
 
@@ -249,6 +255,48 @@ class ChatService:
             )
             timing["sql_ms"] = sql_ms
             timing["rag_ms"] = rag_ms
+            timing["parallel_wall_ms"] = max(sql_ms, rag_ms)
+            # 并行分支各自从同一路由状态追加；合并时去重路由段，并显式标记并行
+            route_actions = list(state.get("trace_actions") or [])
+            n = len(route_actions)
+
+            def _tag_parallel_branch(
+                extras: list[dict[str, Any]], *, branch: str
+            ) -> list[dict[str, Any]]:
+                tagged: list[dict[str, Any]] = []
+                for action in extras:
+                    detail = dict(action.get("detail") or {})
+                    detail["parallel"] = True
+                    detail["branch"] = branch
+                    label = str(action.get("label") or "")
+                    prefix = "[SQL 支路] " if branch == "sql" else "[RAG 支路] "
+                    if not label.startswith(prefix):
+                        label = f"{prefix}{label}"
+                    tagged.append({**action, "label": label, "detail": detail})
+                return tagged
+
+            sql_extra = _tag_parallel_branch(
+                list(sql_state.get("trace_actions") or [])[n:], branch="sql"
+            )
+            rag_extra = _tag_parallel_branch(
+                list(rag_state.get("trace_actions") or [])[n:], branch="rag"
+            )
+            parallel_fork = {
+                "id": "parallel_sql_rag",
+                "label": "SQL ∥ RAG 并行发起",
+                "status": "ok",
+                "duration_ms": max(sql_ms, rag_ms),
+                "detail": {
+                    "parallel": True,
+                    "mode": "asyncio.gather",
+                    "sql_branch_ms": round(sql_ms, 2),
+                    "rag_branch_ms": round(rag_ms, 2),
+                    "wall_ms": round(max(sql_ms, rag_ms), 2),
+                    "note": "两侧同时启动；墙钟≈较慢一侧，不等于两者相加",
+                    "sql_step_count": len(sql_extra),
+                    "rag_step_count": len(rag_extra),
+                },
+            }
             state = {
                 **state,
                 "metrics_context": sql_state.get("metrics_context", ""),
@@ -257,6 +305,10 @@ class ChatService:
                 "visualizations": sql_state.get("visualizations", []),
                 "rag_context": rag_state.get("rag_context", ""),
                 "sources": rag_state.get("sources", []),
+                "trace_actions": route_actions
+                + [parallel_fork]
+                + sql_extra
+                + rag_extra,
             }
             events.append({"stage": "enriching_sql_with_rag"})
             t_en = time.perf_counter()
@@ -342,6 +394,9 @@ class ChatService:
         semantic_skipped: bool = False,
         degraded: bool = False,
         viewer: AuthUser,
+        actions: list[dict[str, Any]] | None = None,
+        stream_error: str | None = None,
+        follow_up: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """返回 (落库用完整 metadata, 返回客户端的 metadata)."""
         full = attach_trace(
@@ -359,6 +414,9 @@ class ChatService:
                 has_rag=bool(metadata.get("has_rag_context")),
                 request_id=request_id,
                 route_via=metadata.get("route_via") or timing.get("route_via"),
+                actions=actions,
+                stream_error=stream_error or metadata.get("stream_error"),
+                follow_up=follow_up,
             ),
         )
         client = strip_trace_for_client(full, keep=viewer.is_admin)
@@ -437,6 +495,7 @@ class ChatService:
                 cache_score=hit.score,
                 degraded=False,
                 viewer=user,
+                follow_up=is_follow_up,
             )
             await asyncio.to_thread(
                 self._persist_turn,
@@ -465,7 +524,76 @@ class ChatService:
                 metadata=client_meta,
             )
 
-        state, _events, retrieve_timing = await self._retrieve_contexts(state)
+        try:
+            state, _events, retrieve_timing = await self._retrieve_contexts(state)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("同步检索编排失败: %s", exc)
+            actions = list(state.get("trace_actions") or [])
+            actions.append(
+                {
+                    "id": "pipeline_error",
+                    "label": "流水线异常中断",
+                    "status": "error",
+                    "detail": {"stage": "retrieve", "error": str(exc)},
+                }
+            )
+            answer = FALLBACK_ANSWER
+            timing = {
+                "cache_lookup_ms": cache_info.get("cache_lookup_ms", 0.0),
+                "total_ms": _ms_since(t0),
+                "route_via": state.get("route_via"),
+            }
+            metadata = self._build_metadata(
+                state,
+                answer=answer,
+                visualizations=[],
+                degraded=True,
+                timing={k: v for k, v in timing.items() if k != "route_via"},
+            )
+            if request_id:
+                metadata["request_id"] = request_id
+            if timing.get("route_via"):
+                metadata["route_via"] = timing["route_via"]
+            store_meta, client_meta = self._with_trace(
+                metadata,
+                mode="sync",
+                route=state.get("route") or None,
+                timing=timing,
+                request_id=request_id,
+                semantic_skipped=bool(cache_info.get("semantic_skipped")),
+                degraded=True,
+                viewer=user,
+                actions=actions,
+                stream_error=str(exc),
+                follow_up=is_follow_up,
+            )
+            await asyncio.to_thread(
+                self._persist_turn,
+                session_id,
+                request,
+                answer,
+                user_id=user.id,
+                route=state.get("route") or None,
+                sources=state.get("sources", []),
+                metadata=store_meta,
+            )
+            self._finish_chat_observability(
+                mode="sync",
+                role=role,
+                route=state.get("route") or None,
+                cache_mode=None,
+                degraded=True,
+                timing=timing,
+                session_id=session_id,
+            )
+            return ChatResponse(
+                answer=answer,
+                session_id=session_id,
+                route=state.get("route") or None,
+                sources=state.get("sources", []),
+                metadata=client_meta,
+            )
+
         route = state.get("route") or "hybrid"
 
         t_gen = time.perf_counter()
@@ -504,6 +632,8 @@ class ChatService:
             semantic_skipped=bool(cache_info.get("semantic_skipped")),
             degraded=degraded,
             viewer=user,
+            actions=list(result.get("trace_actions") or state.get("trace_actions") or []),
+            follow_up=is_follow_up,
         )
         await asyncio.to_thread(
             self._persist_turn,
@@ -600,6 +730,7 @@ class ChatService:
                     cache_score=hit.score,
                     degraded=False,
                     viewer=user,
+                    follow_up=is_follow_up,
                 )
                 yield format_sse(
                     "status",
@@ -644,7 +775,90 @@ class ChatService:
         else:
             observe_cache("disabled")
 
-        state, status_events, retrieve_timing = await self._retrieve_contexts(state)
+        try:
+            state, status_events, retrieve_timing = await self._retrieve_contexts(state)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("流式检索编排失败: %s", exc)
+            actions = list(state.get("trace_actions") or [])
+            actions.append(
+                {
+                    "id": "pipeline_error",
+                    "label": "流水线异常中断",
+                    "status": "error",
+                    "detail": {"stage": "retrieve", "error": str(exc)},
+                }
+            )
+            answer = FALLBACK_ANSWER
+            timing = {
+                "cache_lookup_ms": cache_info.get("cache_lookup_ms", 0.0),
+                "total_ms": _ms_since(t0),
+                "route_via": state.get("route_via"),
+            }
+            metadata = self._build_metadata(
+                state,
+                answer=answer,
+                visualizations=[],
+                degraded=True,
+                timing={k: v for k, v in timing.items() if k != "route_via"},
+            )
+            if request_id:
+                metadata["request_id"] = request_id
+            metadata["stream_error"] = str(exc)
+            if timing.get("route_via"):
+                metadata["route_via"] = timing["route_via"]
+            store_meta, client_meta = self._with_trace(
+                metadata,
+                mode="stream",
+                route=state.get("route") or None,
+                timing=timing,
+                request_id=request_id,
+                semantic_skipped=bool(cache_info.get("semantic_skipped")),
+                degraded=True,
+                viewer=user,
+                actions=actions,
+                stream_error=str(exc),
+                follow_up=is_follow_up,
+            )
+            yield format_sse(
+                "error",
+                {
+                    "stage": "retrieve",
+                    "message": str(exc),
+                    "degraded": True,
+                },
+            )
+            yield format_sse("token", {"content": answer})
+            await asyncio.to_thread(
+                self._persist_turn,
+                session_id,
+                request,
+                answer,
+                user_id=user.id,
+                route=state.get("route") or None,
+                sources=state.get("sources", []),
+                metadata=store_meta,
+            )
+            self._finish_chat_observability(
+                mode="stream",
+                role=role,
+                route=state.get("route") or None,
+                cache_mode=None,
+                degraded=True,
+                timing=timing,
+                session_id=session_id,
+            )
+            yield format_sse(
+                "done",
+                {
+                    "answer": answer,
+                    "session_id": session_id,
+                    "route": state.get("route") or None,
+                    "sources": state.get("sources", []),
+                    "metadata": client_meta,
+                },
+            )
+            return
+
         for ev in status_events:
             yield format_sse("status", ev)
         route = state.get("route", "hybrid")
@@ -705,6 +919,25 @@ class ChatService:
         answer, visualizations = self._finalize_answer_and_viz(state, answer)
         state["answer"] = answer
         state["visualizations"] = visualizations
+        # 流式路径不走 generate_answer 节点，在此补齐行动线末端
+        actions = list(state.get("trace_actions") or [])
+        actions.append(
+            {
+                "id": "generate",
+                "label": "答案生成（流式）",
+                "status": "error" if degraded else "ok",
+                "detail": {
+                    "answer_chars": len(answer or ""),
+                    "has_sql": bool(state.get("sql_result")),
+                    "has_rag": bool(state.get("rag_context")),
+                    "ttft_ms": ttft_ms,
+                    "degraded": degraded,
+                    "stream_error": stream_error,
+                    "partial": bool(answer_parts) and degraded,
+                },
+            }
+        )
+        state["trace_actions"] = actions
         sources = state.get("sources", [])
         timing = {
             **retrieve_timing,
@@ -737,6 +970,9 @@ class ChatService:
             semantic_skipped=bool(cache_info.get("semantic_skipped")),
             degraded=degraded,
             viewer=user,
+            actions=actions,
+            stream_error=stream_error,
+            follow_up=is_follow_up,
         )
         await asyncio.to_thread(
             self._persist_turn,

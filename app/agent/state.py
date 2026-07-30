@@ -11,6 +11,11 @@ class AgentState(TypedDict):
     question: str
     route: Literal["sql", "rag", "hybrid", ""]
     route_via: Literal["rule", "llm", "fallback", ""]
+    route_reason: str
+    route_sql_hits: list[str]
+    route_rag_hits: list[str]
+    route_hybrid_hits: list[str]
+    route_llm_invoked: bool
     user_role: Literal["manager", "user", ""]
     metrics_context: str
     sql_result: str
@@ -19,6 +24,16 @@ class AgentState(TypedDict):
     sources: list[dict[str, Any]]
     answer: str
     visualizations: list[dict[str, Any]]
+    # admin 执行轨迹细粒度行动线（逐步追加）
+    trace_actions: list[dict[str, Any]]
+
+
+def append_trace_action(
+    state: AgentState | dict[str, Any], action: dict[str, Any]
+) -> list[dict[str, Any]]:
+    actions = list(state.get("trace_actions") or [])
+    actions.append(action)
+    return actions
 
 
 def to_langchain_messages(
