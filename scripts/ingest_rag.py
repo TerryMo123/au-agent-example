@@ -232,6 +232,18 @@ DEMO_DOCS = [
 ]
 
 
+def _clear_dir_contents(path: Path) -> None:
+    """清空目录内容；保留目录本身（Docker volume 挂载点不能 rmtree）."""
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    for child in path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink(missing_ok=True)
+
+
 def _reset_chroma_dir() -> None:
     settings = get_settings()
     if settings.vector_backend_normalized == "http":
@@ -256,9 +268,16 @@ def _reset_chroma_dir() -> None:
         return
 
     persist_dir = Path(settings.chroma_persist_dir)
-    if persist_dir.exists():
-        shutil.rmtree(persist_dir)
-    persist_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        # 优先整目录重建（本地开发）；挂载卷会 Device busy，改清内容
+        if persist_dir.exists():
+            shutil.rmtree(persist_dir)
+        persist_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if getattr(exc, "errno", None) != 16:  # Device or resource busy
+            raise
+        print(f"挂载点无法删除目录本身，改为清空内容: {persist_dir}")
+        _clear_dir_contents(persist_dir)
 
 
 def ingest(*, force: bool = False) -> None:

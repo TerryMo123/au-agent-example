@@ -76,23 +76,33 @@ def build_trace(
 
     # 1) 缓存阶段
     cache_lookup_ms = _ms(timing, "cache_lookup_ms")
+    cache_result = (
+        cache_mode
+        if cache_hit
+        else ("semantic_skipped" if semantic_skipped else "miss")
+    )
     cache_detail: dict[str, Any] = {
-        "result": (
-            cache_mode
-            if cache_hit
-            else ("semantic_skipped" if semantic_skipped else "miss")
-        ),
+        "result": cache_result,
         "follow_up": follow_up,
         "semantic_allowed": not semantic_skipped and not follow_up,
     }
     if cache_hit and cache_score is not None:
         cache_detail["score"] = cache_score
     if cache_lookup_ms is not None or cache_hit or semantic_skipped:
+        if cache_hit:
+            lookup_label = f"缓存查找命中（{cache_mode or 'exact'}）"
+            lookup_status = "ok"
+        elif semantic_skipped:
+            lookup_label = "缓存查找：仅 exact（追问跳过 semantic）"
+            lookup_status = "skipped"
+        else:
+            lookup_label = "缓存查找未命中（exact → semantic）"
+            lookup_status = "skipped"
         steps.append(
             _step(
                 id="cache_lookup",
-                label="缓存查找（exact → semantic）",
-                status="ok",
+                label=lookup_label,
+                status=lookup_status,
                 duration_ms=cache_lookup_ms,
                 detail=cache_detail,
             )
@@ -101,7 +111,7 @@ def build_trace(
         steps.append(
             _step(
                 id="cache_hit",
-                label=f"缓存命中复用答案（{cache_mode or 'exact'}）",
+                label=f"复用缓存答案（跳过路由/检索/生成）",
                 status="ok",
                 duration_ms=0.0,
                 detail={"mode": cache_mode, "score": cache_score},
