@@ -1,0 +1,4 @@
+# HTTPS 证书目录（勿提交私钥到 Git）
+*
+!.gitignore
+!README.md

@@ -37,6 +37,9 @@ services:
     build:
       context: ../au-agent-web-example
       dockerfile: Dockerfile
+      args:
+        # 构建时传入百度统计 ID（也可在服务器 export 后 build）
+        VITE_BAIDU_TONGJI_ID: ${VITE_BAIDU_TONGJI_ID:-0c9d8aab323d726a31b6d312bdcf58a9}
     image: au-agent-web:latest
     restart: unless-stopped
     depends_on:
@@ -44,9 +47,15 @@ services:
         condition: service_healthy
     ports:
       - "80:80"
-    # 运行时挂载配置，改 conf 不必重建镜像（避免缓存导致旧 conf 仍在用）
+      # 启用 HTTPS 后取消下一行注释，并改用 nginx-web-ssl.conf（见 deploy/certs/README.md）
+      # - "443:443"
     volumes:
       - ./deploy/nginx-web.conf:/etc/nginx/conf.d/default.conf:ro
+      # HTTPS：
+      # - ./deploy/nginx-web-ssl.conf:/etc/nginx/conf.d/default.conf:ro
+      # - ./deploy/certs:/etc/nginx/certs:ro
+      # - ./deploy/certbot/www:/var/www/certbot:ro
+      - ./deploy/certbot/www:/var/www/certbot:ro
 
 volumes:
   redis_data:
