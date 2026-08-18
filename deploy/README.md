@@ -9,6 +9,18 @@
 
 ## 架构建议
 
+**Docker 单机（当前）：** 域名入口在独立仓库 `moyong-gateway`（占 80，路径 `/au`）。本仓库 compose **不再映射 80**，也不再包含站点级 Nginx。
+
+```
+浏览器 → moyong-gateway:80 /au
+              ├─ /au/     → au-agent-web
+              └─ /au/api/ → au-agent-api → MySQL(外部)
+                                    ├→ Redis
+                                    └→ Chroma
+```
+
+**Kubernetes：** 仍可用本目录 `deploy/k8s/*`（Ingress 进 Web）。
+
 ```
 浏览器 → Ingress(TLS) → au-agent-web(×N)
                               └─ /api → au-agent-api(×1~N) → MySQL(外部)
@@ -36,9 +48,13 @@
 
 ## 1. 先用 Docker Compose 验证（推荐）
 
-在 **API 仓库根目录**：
+先起网关（创建 `moyong-edge` 并占 80），再在 **API 仓库根目录** 起业务：
 
 ```bash
+cd /path/to/moyong-gateway
+docker compose up -d
+
+cd /path/to/au-agent-example
 cp .env.prod.example .env.prod
 # 编辑 .env.prod：填 OPENAI_API_KEY、MYSQL_*（宿主机 MySQL 用 host 网络或宿主机内网 IP，不要写 127.0.0.1 除非用 host 模式）
 
@@ -49,8 +65,9 @@ docker compose -f docker-compose.prod.yml up -d --build
 docker compose -f docker-compose.prod.yml exec au-agent-api \
   python scripts/ingest_rag.py
 
-# 浏览器打开 http://服务器IP:8080
-curl -s http://127.0.0.1:8080/api/v1/health
+# 经网关访问
+curl -s http://127.0.0.1/au/api/v1/health
+# 浏览器：http://moyong.net/au/chat
 ```
 
 ## 2. 构建并推送镜像
